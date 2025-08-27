@@ -108,7 +108,9 @@ func main() {
 }
 
 func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
-	url := fmt.Sprintf("https://monitorsiogranos.magyp.gob.ar/ws/ssma/precios_fob.php?Fecha=%s", date.Format("02/01/2006"))
+	url := fmt.Sprintf("https://magyp.gob.ar/sitio/areas/ss_mercados_agropecuarios/ws/ssma/precios_fob.php?Fecha=%s", date.Format("02/01/2006"))
+
+	log.Printf("Consultando URL: %s", url)
 
 	for i := 0; i <= retries; i++ {
 		resp, err := http.Get(url)
@@ -116,6 +118,7 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			if i == retries {
 				return nil, fmt.Errorf("fallo al conectar con la API: %w", err)
 			}
+			log.Printf("Reintento %d/%d: error de conexión, esperando %d segundos...", i+1, retries+1, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -125,6 +128,7 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			if i == retries {
 				return nil, fmt.Errorf("API respondió con código: %d", resp.StatusCode)
 			}
+			log.Printf("Reintento %d/%d: API respondió con código %d, esperando %d segundos...", i+1, retries+1, resp.StatusCode, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -134,24 +138,78 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			return nil, fmt.Errorf("error leyendo respuesta: %w", err)
 		}
 
+		// Log de la respuesta para debugging
+		log.Printf("Respuesta del API (primeros 500 caracteres): %s", string(body[:min(len(body), 500)]))
+		log.Printf("Longitud de la respuesta: %d bytes", len(body))
+		log.Printf("Content-Type: %s", resp.Header.Get("Content-Type"))
+
+		// Verificar si la respuesta está vacía
+		if len(body) == 0 {
+			if i == retries {
+				return nil, fmt.Errorf("API devolvió respuesta vacía")
+			}
+			log.Printf("Reintento %d/%d: API devolvió respuesta vacía, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+			time.Sleep(time.Second * time.Duration(2*(i+1)))
+			continue
+		}
+
+		// Verificar si la respuesta es HTML (error común)
+		if len(body) > 0 && (body[0] == '<' || string(body[:5]) == "<html") {
+			if i == retries {
+				return nil, fmt.Errorf("API devolvió HTML en lugar de JSON: %s", string(body[:min(len(body), 200)]))
+			}
+			log.Printf("Reintento %d/%d: API devolvió HTML, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+			time.Sleep(time.Second * time.Duration(2*(i+1)))
+			continue
+		}
+
+		// Verificar si la respuesta es un mensaje de error
+		if len(body) > 0 && (body[0] == 'E' || string(body[:5]) == "Error") {
+			if i == retries {
+				return nil, fmt.Errorf("API devolvió mensaje de error: %s", string(body))
+			}
+			log.Printf("Reintento %d/%d: API devolvió error '%s', esperando %d segundos...", i+1, retries+1, string(body), 2*(i+1))
+			time.Sleep(time.Second * time.Duration(2*(i+1)))
+			continue
+		}
+
 		// Intentar decodificar como {"posts": [...]}
 		var wrapper struct {
 			Posts []PrecioFOB `json:"posts"`
 		}
 		if err := json.Unmarshal(body, &wrapper); err == nil {
+			log.Printf("JSON parseado exitosamente como wrapper con %d posts", len(wrapper.Posts))
 			return wrapper.Posts, nil
 		}
 
 		// Si falla, intentar como array plano
 		var direct []PrecioFOB
 		if err := json.Unmarshal(body, &direct); err == nil {
+			log.Printf("JSON parseado exitosamente como array directo con %d elementos", len(direct))
 			return direct, nil
 		}
 
-		return nil, fmt.Errorf("error al parsear JSON: no se pudo interpretar como objeto ni como array")
+		// Si ambos fallan, mostrar el error específico del JSON
+		log.Printf("Error parseando wrapper: %v", json.Unmarshal(body, &wrapper))
+		log.Printf("Error parseando array directo: %v", json.Unmarshal(body, &direct))
+
+		if i == retries {
+			return nil, fmt.Errorf("error al parsear JSON: no se pudo interpretar como objeto ni como array")
+		}
+
+		log.Printf("Reintento %d/%d: JSON inválido, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+		time.Sleep(time.Second * time.Duration(2*(i+1)))
 	}
 
 	return nil, fmt.Errorf("fallo tras %d reintentos", retries)
+}
+
+// Función auxiliar para min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func connectToDB() *pgx.Conn {

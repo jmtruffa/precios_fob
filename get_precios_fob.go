@@ -13,6 +13,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Loggers: info -> stdout, fatal/errores graves -> stderr
+var (
+	infoLogger  = log.New(os.Stdout, "INFO: ", log.LstdFlags)
+	errorLogger = log.New(os.Stderr, "FATAL: ", log.LstdFlags) // usar sólo para errores que terminan el proceso
+)
+
 type PrecioFOB struct {
 	Fecha    string   `json:"fecha"`
 	Circular string   `json:"circular"`
@@ -28,14 +34,15 @@ func main() {
 	fmt.Println("-------------------------------------------------------------")
 	fmt.Println("Iniciando importación de precios FOB...")
 
-	conn := connectToDB()
+	conn := connectToDB() // si falla, termina con mail (stderr)
 	defer conn.Close(context.Background())
 
 	// Obtener última fecha registrada
 	var lastDate *time.Time
 	err := conn.QueryRow(context.Background(), `SELECT MAX(date) FROM precios_fob`).Scan(&lastDate)
 	if err != nil {
-		log.Fatalf("Error consultando última fecha: %v", err)
+		// Fatal: que mande mail
+		errorLogger.Fatalf("Error consultando última fecha: %v", err)
 	}
 
 	var startDate time.Time
@@ -51,24 +58,25 @@ func main() {
 	for d := startDate; !d.After(today); d = d.AddDate(0, 0, 1) {
 		precios, err := fetchPreciosFOB(d, 3)
 		if err != nil {
-			log.Printf("Error consultando %s: %v", d.Format("2006-01-02"), err)
+			// No fatal: queda en stdout (no manda mail)
+			infoLogger.Printf("Error consultando %s: %v", d.Format("2006-01-02"), err)
 			continue
 		}
 		if len(precios) == 0 {
 			continue
 		}
 
-		insertedThisDay := 0 // <<--- nuevo
+		insertedThisDay := 0
 
 		for _, p := range precios {
 			if p.Precio == nil || p.MesDesde == nil || p.AnoDesde == nil || p.MesHasta == nil || p.AnoHasta == nil {
-				log.Printf("Fila incompleta (precio o fecha NULL) para %s / %s. Omitida.", p.Fecha, p.Posicion)
+				infoLogger.Printf("Fila incompleta (precio o fecha NULL) para %s / %s. Omitida.", p.Fecha, p.Posicion)
 				continue
 			}
 
 			parsedDate, err := time.Parse("2006-01-02 15:04:05.000", p.Fecha)
 			if err != nil {
-				log.Printf("Fecha malformateada: %s", p.Fecha)
+				infoLogger.Printf("Fecha malformateada: %s", p.Fecha)
 				continue
 			}
 
@@ -77,7 +85,7 @@ func main() {
 				`SELECT EXISTS(SELECT 1 FROM precios_fob WHERE date=$1 AND posicion=$2)`,
 				parsedDate, p.Posicion).Scan(&exists)
 			if err != nil {
-				log.Printf("Error verificando duplicado: %v", err)
+				infoLogger.Printf("Error verificando duplicado: %v", err)
 				continue
 			}
 			if exists {
@@ -92,7 +100,7 @@ func main() {
 				*p.MesDesde, *p.AnoDesde, *p.MesHasta, *p.AnoHasta,
 			)
 			if err != nil {
-				log.Printf("Error insertando fila: %v", err)
+				infoLogger.Printf("Error insertando fila: %v", err)
 			} else {
 				inserted++
 				insertedThisDay++
@@ -110,7 +118,8 @@ func main() {
 func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 	url := fmt.Sprintf("https://magyp.gob.ar/sitio/areas/ss_mercados_agropecuarios/ws/ssma/precios_fob.php?Fecha=%s", date.Format("02/01/2006"))
 
-	log.Printf("Consultando URL: %s", url)
+	// Info a stdout
+	infoLogger.Printf("Consultando URL: %s", url)
 
 	for i := 0; i <= retries; i++ {
 		resp, err := http.Get(url)
@@ -118,7 +127,7 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			if i == retries {
 				return nil, fmt.Errorf("fallo al conectar con la API: %w", err)
 			}
-			log.Printf("Reintento %d/%d: error de conexión, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+			infoLogger.Printf("Reintento %d/%d: error de conexión, esperando %d segundos...", i+1, retries+1, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -128,7 +137,7 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			if i == retries {
 				return nil, fmt.Errorf("API respondió con código: %d", resp.StatusCode)
 			}
-			log.Printf("Reintento %d/%d: API respondió con código %d, esperando %d segundos...", i+1, retries+1, resp.StatusCode, 2*(i+1))
+			infoLogger.Printf("Reintento %d/%d: API respondió con código %d, esperando %d segundos...", i+1, retries+1, resp.StatusCode, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -138,27 +147,27 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			return nil, fmt.Errorf("error leyendo respuesta: %w", err)
 		}
 
-		// Log de la respuesta para debugging
-		log.Printf("Respuesta del API (primeros 500 caracteres): %s", string(body[:min(len(body), 500)]))
-		log.Printf("Longitud de la respuesta: %d bytes", len(body))
-		log.Printf("Content-Type: %s", resp.Header.Get("Content-Type"))
+		// Debug a stdout
+		infoLogger.Printf("Respuesta del API (primeros 500 caracteres): %s", string(body[:min(len(body), 500)]))
+		infoLogger.Printf("Longitud de la respuesta: %d bytes", len(body))
+		infoLogger.Printf("Content-Type: %s", resp.Header.Get("Content-Type"))
 
 		// Verificar si la respuesta está vacía
 		if len(body) == 0 {
 			if i == retries {
 				return nil, fmt.Errorf("API devolvió respuesta vacía")
 			}
-			log.Printf("Reintento %d/%d: API devolvió respuesta vacía, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+			infoLogger.Printf("Reintento %d/%d: API devolvió respuesta vacía, esperando %d segundos...", i+1, retries+1, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
 
-		// Verificar si la respuesta es HTML (error común)
+		// Verificar si la respuesta es HTML
 		if len(body) > 0 && (body[0] == '<' || string(body[:5]) == "<html") {
 			if i == retries {
 				return nil, fmt.Errorf("API devolvió HTML en lugar de JSON: %s", string(body[:min(len(body), 200)]))
 			}
-			log.Printf("Reintento %d/%d: API devolvió HTML, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+			infoLogger.Printf("Reintento %d/%d: API devolvió HTML, esperando %d segundos...", i+1, retries+1, 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -168,7 +177,7 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			if i == retries {
 				return nil, fmt.Errorf("API devolvió mensaje de error: %s", string(body))
 			}
-			log.Printf("Reintento %d/%d: API devolvió error '%s', esperando %d segundos...", i+1, retries+1, string(body), 2*(i+1))
+			infoLogger.Printf("Reintento %d/%d: API devolvió error '%s', esperando %d segundos...", i+1, retries+1, string(body), 2*(i+1))
 			time.Sleep(time.Second * time.Duration(2*(i+1)))
 			continue
 		}
@@ -178,26 +187,26 @@ func fetchPreciosFOB(date time.Time, retries int) ([]PrecioFOB, error) {
 			Posts []PrecioFOB `json:"posts"`
 		}
 		if err := json.Unmarshal(body, &wrapper); err == nil {
-			log.Printf("JSON parseado exitosamente como wrapper con %d posts", len(wrapper.Posts))
+			infoLogger.Printf("JSON parseado exitosamente como wrapper con %d posts", len(wrapper.Posts))
 			return wrapper.Posts, nil
 		}
 
 		// Si falla, intentar como array plano
 		var direct []PrecioFOB
 		if err := json.Unmarshal(body, &direct); err == nil {
-			log.Printf("JSON parseado exitosamente como array directo con %d elementos", len(direct))
+			infoLogger.Printf("JSON parseado exitosamente como array directo con %d elementos", len(direct))
 			return direct, nil
 		}
 
-		// Si ambos fallan, mostrar el error específico del JSON
-		log.Printf("Error parseando wrapper: %v", json.Unmarshal(body, &wrapper))
-		log.Printf("Error parseando array directo: %v", json.Unmarshal(body, &direct))
+		// Si ambos fallan, mostrar el error específico del JSON (a stdout porque no es fatal)
+		infoLogger.Printf("Error parseando wrapper: %v", json.Unmarshal(body, &wrapper))
+		infoLogger.Printf("Error parseando array directo: %v", json.Unmarshal(body, &direct))
 
 		if i == retries {
 			return nil, fmt.Errorf("error al parsear JSON: no se pudo interpretar como objeto ni como array")
 		}
 
-		log.Printf("Reintento %d/%d: JSON inválido, esperando %d segundos...", i+1, retries+1, 2*(i+1))
+		infoLogger.Printf("Reintento %d/%d: JSON inválido, esperando %d segundos...", i+1, retries+1, 2*(i+1))
 		time.Sleep(time.Second * time.Duration(2*(i+1)))
 	}
 
@@ -227,7 +236,8 @@ func connectToDB() *pgx.Conn {
 
 	conn, err := pgx.Connect(context.Background(), connStr)
 	if err != nil {
-		log.Fatalf("No se pudo conectar a la base de datos: %v", err)
+		// Fatal: que mande mail
+		errorLogger.Fatalf("No se pudo conectar a la base de datos: %v", err)
 	}
 	return conn
 }
